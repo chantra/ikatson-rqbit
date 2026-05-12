@@ -611,6 +611,7 @@ async fn async_main(mut opts: Opts, cancel: CancellationToken) -> anyhow::Result
             .as_ref()
             .map(|s| s.split(",").map(|v| v.to_string()).collect()),
         dht_config: None,
+        dht_listen_addr: None,
         // This will be overridden by "server start" below if needed.
         persistence: None,
         peer_id: None,

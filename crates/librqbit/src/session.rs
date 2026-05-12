@@ -2,7 +2,7 @@ use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
     io::Read,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     path::{Component, Path, PathBuf},
     sync::{
         Arc,
@@ -399,8 +399,11 @@ pub struct SessionOptions {
     /// Pass in to configure DHT persistence filename. This can be used to run multiple
     /// librqbit instances at a time.
     pub dht_config: Option<PersistentDhtConfig>,
-    /// A list o DHT bootstrap nodes as strings of the form host:port or ip:port
+    /// A list of DHT bootstrap nodes as strings of the form host:port or ip:port
     pub dht_bootstrap_addrs: Option<Vec<String>>,
+    /// The address for the DHT server to listen on (e.g. "0.0.0.0:6881").
+    /// Only used when DHT persistence is disabled.
+    pub dht_listen_addr: Option<SocketAddr>,
 
     /// What network device to bind to for DHT, BT-UDP, BT-TCP, trackers and LSD.
     /// On OSX will use IP(V6)_BOUND_IF, on Linux will use SO_BINDTODEVICE.
@@ -553,6 +556,7 @@ impl Session {
                 let dht = if opts.disable_dht_persistence {
                     DhtBuilder::with_config(DhtConfig {
                         bootstrap_addrs: opts.dht_bootstrap_addrs.clone(),
+                        listen_addr: opts.dht_listen_addr,
                         cancellation_token: Some(token.child_token()),
                         bind_device: bind_device.as_ref(),
                         ..Default::default()
@@ -1051,6 +1055,35 @@ impl Session {
                             torrent_from_bytes(bytes).context("error decoding torrent")?
                         }
                     };
+
+                    // BEP-0005: torrent-embedded nodes are DHT bootstrap nodes,
+                    // not BitTorrent peers. Inject them into the DHT routing table.
+                    if !torrent.meta.nodes.is_empty()
+                        && let Some(dht) = &self.dht
+                    {
+                        let addrs: Vec<SocketAddr> = torrent
+                            .meta
+                            .nodes
+                            .iter()
+                            .filter_map(|node| {
+                                node.host
+                                    .parse::<IpAddr>()
+                                    .ok()
+                                    .map(|ip| SocketAddr::from((ip, node.port)))
+                            })
+                            .collect();
+                        if !addrs.is_empty() {
+                            info!(nodes = ?addrs, "BEP-0005: bootstrapping DHT from torrent nodes");
+                            let dht = dht.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = dht.add_nodes(addrs).await {
+                                    warn!(
+                                        "BEP-0005: DHT bootstrap from torrent nodes failed: {e:#}"
+                                    );
+                                }
+                            });
+                        }
+                    }
 
                     let mut trackers = torrent
                         .meta

@@ -983,22 +983,7 @@ impl DhtWorker {
             .await
             .map_err(|err| Error::lookup(hostname, err))?
             .collect::<Vec<_>>();
-        let v4 = RecursiveRequest::find_node_for_routing_table(
-            self.dht.clone(),
-            self.dht.id,
-            addrs.iter().copied().filter(|a| a.is_ipv4()),
-        )
-        .instrument(debug_span!("v4"));
-
-        let v6 = RecursiveRequest::find_node_for_routing_table(
-            self.dht.clone(),
-            self.dht.id,
-            addrs.iter().copied().filter(|a| a.is_ipv6()),
-        )
-        .instrument(debug_span!("v6"));
-
-        let (v4, v6) = tokio::join!(v4, v6);
-        v4.or(v6)
+        self.dht.add_nodes(addrs).await
     }
 
     async fn bootstrap_hostname_with_backoff(&self, addr: &str) -> crate::Result<()> {
@@ -1018,6 +1003,9 @@ impl DhtWorker {
     }
 
     async fn bootstrap(&self, bootstrap_addrs: &[String]) -> crate::Result<()> {
+        if bootstrap_addrs.is_empty() {
+            return Ok(());
+        }
         let mut futs = FuturesUnordered::new();
 
         for addr in bootstrap_addrs.iter() {
@@ -1370,9 +1358,24 @@ impl DhtState {
         f(&self.routing_table_v4.read(), &self.routing_table_v6.read())
     }
 
-    // pub fn clone_routing_table(&self) -> RoutingTable {
-    //     self.routing_table.read().clone()
-    // }
+    pub async fn add_nodes(self: &Arc<Self>, addrs: Vec<SocketAddr>) -> crate::Result<()> {
+        let v4_addrs: Vec<_> = addrs.iter().copied().filter(|a| a.is_ipv4()).collect();
+        let v6_addrs: Vec<_> = addrs.iter().copied().filter(|a| a.is_ipv6()).collect();
+        let v4 = RecursiveRequest::find_node_for_routing_table(
+            self.clone(),
+            self.id,
+            v4_addrs.into_iter(),
+        )
+        .instrument(debug_span!("v4"));
+        let v6 = RecursiveRequest::find_node_for_routing_table(
+            self.clone(),
+            self.id,
+            v6_addrs.into_iter(),
+        )
+        .instrument(debug_span!("v6"));
+        let (r4, r6) = tokio::join!(v4, v6);
+        r4.or(r6)
+    }
 }
 
 trait FromSocketAddr: Sized {
@@ -1394,5 +1397,89 @@ impl FromSocketAddr for SocketAddrV6 {
             SocketAddr::V6(a) => Some(a),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn create_isolated_dht() -> (Arc<DhtState>, CancellationToken) {
+        let token = CancellationToken::new();
+        let dht = DhtState::with_config(DhtConfig {
+            // Empty bootstrap list: avoid contacting public DHT servers
+            // in tests. We only want localhost node-to-node discovery.
+            bootstrap_addrs: Some(vec![]),
+            listen_addr: Some("127.0.0.1:0".parse().unwrap()),
+            cancellation_token: Some(token.clone()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        (dht, token)
+    }
+
+    /// Pre-populate `src`'s routing table with `target`'s id and listen address,
+    /// so that `src` returns `target` in find_node responses.
+    fn cross_link(src: &DhtState, target: &DhtState) {
+        let addr = target.listen_addr();
+        src.get_table_for_addr(addr)
+            .write()
+            .add_node(target.id, addr);
+    }
+
+    #[tokio::test]
+    async fn test_add_nodes_populates_routing_table() {
+        let _ = tracing_subscriber::fmt::try_init();
+
+        let (dht_a, token_a) = create_isolated_dht().await;
+        let (dht_b, token_b) = create_isolated_dht().await;
+        let (dht_c, token_c) = create_isolated_dht().await;
+
+        // Cross-link dht_b and dht_c so they return each other in find_node
+        // responses. This simulates bootstrap nodes with populated tables.
+        cross_link(&dht_b, &dht_c);
+        cross_link(&dht_c, &dht_b);
+
+        dht_a
+            .add_nodes(vec![dht_b.listen_addr(), dht_c.listen_addr()])
+            .await
+            .unwrap();
+
+        let stats = dht_a.get_stats();
+        assert!(
+            stats.routing_table_size >= 2,
+            "expected at least 2 nodes in routing table, got {}",
+            stats.routing_table_size,
+        );
+
+        token_a.cancel();
+        token_b.cancel();
+        token_c.cancel();
+    }
+
+    #[tokio::test]
+    async fn test_add_nodes_discovers_specific_node_ids() {
+        let _ = tracing_subscriber::fmt::try_init();
+
+        let (dht_a, token_a) = create_isolated_dht().await;
+        let (dht_b, token_b) = create_isolated_dht().await;
+        let (dht_c, token_c) = create_isolated_dht().await;
+
+        // dht_b knows about dht_c, so when dht_a queries dht_b,
+        // it discovers dht_c through the find_node walk.
+        cross_link(&dht_b, &dht_c);
+
+        dht_a.add_nodes(vec![dht_b.listen_addr()]).await.unwrap();
+
+        let found_c = dht_a.with_routing_tables(|v4, _v6| v4.iter().any(|n| n.id() == dht_c.id));
+        assert!(
+            found_c,
+            "expected dht_c's node ID in dht_a's routing table after discovering it via dht_b"
+        );
+
+        token_a.cancel();
+        token_b.cancel();
+        token_c.cancel();
     }
 }
