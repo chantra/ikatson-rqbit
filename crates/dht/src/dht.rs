@@ -426,19 +426,21 @@ impl<C: RecursiveRequestCallbacks> RecursiveRequest<C> {
             self.callbacks.on_request_start(self, id, addr);
         }
 
-        let response = self
-            .dht
-            .request(self.request.clone(), addr)
-            .await
-            .inspect(|r| {
-                self.mark_node_responded(addr, r);
-            });
-        if let Some(id) = id {
-            self.callbacks.on_request_end(self, id, addr, &response);
-        }
-
         let response = match self.dht.request(self.request.clone(), addr).await {
-            Ok(ResponseOrError::Response(r)) => r,
+            Ok(ResponseOrError::Response(r)) => {
+                // When id was unknown (initial bootstrap address), learn it
+                // from the response and add to routing table.
+                let node_id = id.unwrap_or(r.id);
+                if id.is_none() {
+                    self.callbacks.on_request_start(self, node_id, addr);
+                }
+                let resp_ref = Ok(ResponseOrError::Response(r));
+                self.callbacks.on_request_end(self, node_id, addr, &resp_ref);
+                match resp_ref {
+                    Ok(ResponseOrError::Response(r)) => r,
+                    _ => unreachable!(),
+                }
+            }
             Ok(ResponseOrError::Error(e)) => {
                 debug!("error response: {e:?}");
                 return Err(Error::ErrorResponse);
