@@ -184,6 +184,37 @@ impl PeerStore {
         true
     }
 
+    /// Directly inject a peer for a given info_hash, bypassing token and distance checks.
+    /// Used for self-announcement in private/single-node DHT deployments.
+    pub fn inject_peer(&self, info_hash: Id20, addr: SocketAddr) -> bool {
+        let peers_len = self.peers_len.load(std::sync::atomic::Ordering::SeqCst);
+        if peers_len >= self.max_remembered_peers {
+            return false;
+        }
+
+        use dashmap::mapref::entry::Entry;
+        match self.peers.entry(info_hash) {
+            Entry::Occupied(mut occ) => {
+                if occ.get().iter().any(|s| s.addr == addr) {
+                    return true;
+                }
+                occ.get_mut().push(StoredPeer {
+                    addr,
+                    time: Utc::now(),
+                });
+            }
+            Entry::Vacant(vac) => {
+                vac.insert(vec![StoredPeer {
+                    addr,
+                    time: Utc::now(),
+                }]);
+            }
+        }
+        self.peers_len
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        true
+    }
+
     pub fn get_for_info_hash(&self, info_hash: Id20, want: Want) -> Vec<CompactSocketAddr> {
         if let Some(stored_peers) = self.peers.get(&info_hash) {
             return stored_peers
@@ -204,5 +235,28 @@ impl PeerStore {
     #[allow(dead_code)]
     pub fn garbage_collect_peers(&self) {
         todo!()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_inject_peer() {
+        let self_id = Id20::from_str("0000000000000000000000000000000000000000").unwrap();
+        let store = PeerStore::new(self_id);
+        let info_hash =
+            Id20::from_str("716c02e585d673b1f9a32b1f73eb9664585b5f55").unwrap();
+        let addr: SocketAddr = "10.0.0.1:6881".parse().unwrap();
+
+        assert!(store.inject_peer(info_hash, addr));
+
+        let peers = store.get_for_info_hash(info_hash, Want::Both);
+        assert_eq!(peers.len(), 1);
+
+        assert!(store.inject_peer(info_hash, addr));
+        let peers = store.get_for_info_hash(info_hash, Want::Both);
+        assert_eq!(peers.len(), 1);
     }
 }

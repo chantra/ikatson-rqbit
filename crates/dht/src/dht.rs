@@ -1354,6 +1354,13 @@ impl DhtState {
         self.get_stats()
     }
 
+    /// Inject a peer directly into the local peer store for a given info_hash.
+    /// This allows a seeder to announce itself to its own DHT node without
+    /// requiring the standard announce_peer protocol flow.
+    pub fn inject_peer(&self, info_hash: Id20, addr: SocketAddr) -> bool {
+        self.peer_store.inject_peer(info_hash, addr)
+    }
+
     pub fn with_routing_tables<R, F: FnOnce(&RoutingTable, &RoutingTable) -> R>(&self, f: F) -> R {
         f(&self.routing_table_v4.read(), &self.routing_table_v6.read())
     }
