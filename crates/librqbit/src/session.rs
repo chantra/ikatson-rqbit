@@ -452,6 +452,9 @@ pub struct SessionOptions {
     /// Default peer limit per torrent.
     pub peer_limit: Option<usize>,
 
+    /// Skip TLS certificate verification for HTTP tracker connections.
+    pub tls_insecure: bool,
+
     #[cfg(feature = "disable-upload")]
     pub disable_upload: bool,
 
@@ -656,6 +659,12 @@ impl Session {
                         b = b.interface(bd);
                     }
                     b
+                };
+
+                let builder = if opts.tls_insecure {
+                    builder.danger_accept_invalid_certs(true)
+                } else {
+                    builder
                 };
 
                 builder.build().context("error building HTTP(S) client")?
